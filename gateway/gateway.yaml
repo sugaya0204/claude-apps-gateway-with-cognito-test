@@ -24,7 +24,10 @@ oidc:
   # requested AND the app's own "Group claim type" is configured under
   # Sign On -> OpenID Connect ID Token (see docs/01-prerequisites.md --
   # requesting the scope alone is necessary but not sufficient on Okta).
-  scopes: [openid, profile, email, offline_access, groups]
+  # Cognitoは groups scope ではなく cognito:groups claim を返す。またデフォルトでIDトークンに含まれるスコープなので cognito:groups scope の定義も不要。
+  # Cognitoはrefresh_token をデフォルトで返すので offline_access scope は不要
+  scopes: [openid, profile, email]
+  # scopes: [openid, profile, email, offline_access, groups] 
   # allowed_email_domains: [example.com]   # uncomment and restrict for production
 
 session:
