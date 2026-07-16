@@ -44,6 +44,32 @@ upstreams:
 
 auto_include_builtin_models: true
 
+# Required for non-US Bedrock regions: auto_include_builtin_models resolves
+# short catalog names to the "us." cross-region inference profile prefix
+# unconditionally, regardless of upstreams[].region above. This deployment
+# runs its Bedrock upstream in ap-northeast-1, where only the jp./global.
+# profile prefixes are valid -- confirmed the hard way via CloudTrail, which
+# showed the gateway invoking `us.anthropic.claude-sonnet-4-6` against the
+# ap-northeast-1 Bedrock Runtime endpoint and Bedrock rejecting it with
+# "The provided model identifier is invalid." This block overrides the
+# per-model Bedrock ID for exactly the three models AVAILABLE_MODELS_RAW
+# above can enable; auto_include_builtin_models stays true so any other
+# model becomes available (via the still-wrong "us." default) without
+# needing this list kept in sync.
+models:
+  - id: claude-opus-4-8
+    label: Claude Opus 4.8
+    upstream_model:
+      bedrock: jp.anthropic.claude-opus-4-8
+  - id: claude-sonnet-4-6
+    label: Claude Sonnet 4.6
+    upstream_model:
+      bedrock: jp.anthropic.claude-sonnet-4-6
+  - id: claude-haiku-4-5
+    label: Claude Haiku 4.5
+    upstream_model:
+      bedrock: jp.anthropic.claude-haiku-4-5-20251001-v1:0
+
 # Enables /v1/organizations/spend_limits and live per-developer spend
 # enforcement, plus the model-access management the admin console uses.
 # admin_groups grants full (read+write) access to any signed-in gateway
