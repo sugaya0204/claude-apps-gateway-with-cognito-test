@@ -1,6 +1,9 @@
 import * as cdk from 'aws-cdk-lib';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as nodejsLambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
+import * as path from 'path';
 
 export interface CognitoStackProps extends cdk.StackProps {
   /**
@@ -23,11 +26,11 @@ export interface CognitoStackProps extends cdk.StackProps {
   readonly logoutUrl: string;
   /**
    * Name of the admin group created in the pool. Mirrors the Okta
-   * `adminOktaGroupName` concept. NOTE: without a Pre-Token-Generation
-   * Lambda this membership surfaces in the ID token as `cognito:groups`,
-   * NOT the `groups` claim the gateway checks -- so admin authorization
-   * will not work on this Lambda-free first pass. Developer sign-in still
-   * exercises end-to-end. See this stack's CfnOutputs for the details.
+   * `adminOktaGroupName` concept. Membership surfaces natively only as the
+   * reserved `cognito:groups` claim; the Pre-Token-Generation trigger in
+   * this stack copies it into a top-level `groups` claim (an array) so the
+   * gateway's admin_groups check matches. Pass the SAME value here as the
+   * main deploy's `-c adminOktaGroupName=...`.
    */
   readonly adminGroupName: string;
 }
@@ -42,11 +45,26 @@ export interface CognitoStackProps extends cdk.StackProps {
  * app entry (bin/cognito.ts), read the outputs, then feed them into the main
  * `cdk deploy` as context. Zero changes to any existing stack.
  *
+ * A Pre-Token-Generation trigger (lambda/cognito-groups-claim-mapper.ts)
+ * remaps Cognito's `cognito:groups` into the `groups` claim the gateway
+ * reads, so admin authorization works -- the one piece that a config-only
+ * Cognito swap cannot cover.
+ *
  * This is a throwaway test pool (RemovalPolicy.DESTROY, self-signup off).
  */
 export class CognitoStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: CognitoStackProps) {
     super(scope, id, props);
+
+    // Pre-Token-Generation trigger that copies `cognito:groups` into a
+    // top-level `groups` array claim the gateway reads. Pure event transform,
+    // no AWS SDK calls -- see lambda/cognito-groups-claim-mapper.ts.
+    const groupsClaimMapper = new nodejsLambda.NodejsFunction(this, 'GroupsClaimMapper', {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: path.join(__dirname, 'lambda', 'cognito-groups-claim-mapper.ts'),
+      handler: 'handler',
+      timeout: cdk.Duration.seconds(5),
+    });
 
     const userPool = new cognito.UserPool(this, 'UserPool', {
       userPoolName: 'claude-gateway-pool',
@@ -57,8 +75,31 @@ export class CognitoStack extends cdk.Stack {
       standardAttributes: {
         email: { required: true, mutable: true },
       },
+      // Emitting the `groups` claim as an ARRAY needs a V2 pre-token event,
+      // which requires the Essentials feature plan. Essentials is already the
+      // default for new pools; set explicitly so the V2 wiring below is
+      // deterministic and the (per-MAU) cost choice is visible in code.
+      // Downgrade to LITE only if you switch the trigger back to V1 (which
+      // can emit string claims only -- likely insufficient for the gateway).
+      featurePlan: cognito.FeaturePlan.ESSENTIALS,
+      lambdaTriggers: {
+        // L2 wires the Cognito->Lambda invoke permission and the (V1) trigger
+        // field; the escape hatch just below upgrades it to a V2 event.
+        preTokenGeneration: groupsClaimMapper,
+      },
       // Throwaway pool: let `cdk destroy` take the pool (and its users) with it.
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Upgrade the pre-token trigger to a V2 event so the Lambda may return an
+    // ARRAY claim value. V1 events (all that lambdaTriggers.preTokenGeneration
+    // configures on its own) carry string claims only, which the gateway's
+    // groups-membership check would not match. No L2 prop exists for the
+    // trigger version, so set PreTokenGenerationConfig directly.
+    const cfnUserPool = userPool.node.defaultChild as cognito.CfnUserPool;
+    cfnUserPool.addPropertyOverride('LambdaConfig.PreTokenGenerationConfig', {
+      LambdaArn: groupsClaimMapper.functionArn,
+      LambdaVersion: 'V2_0',
     });
 
     // The Hosted UI domain that backs the OIDC authorize/token/userinfo
