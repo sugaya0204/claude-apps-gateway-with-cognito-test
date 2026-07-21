@@ -30,7 +30,10 @@ oidc:
   # resulting token/userinfo response omits groups entirely, and the
   # gateway correctly reports "signed in, but not a member of the admin
   # group" for every user regardless of their real membership.
-  scopes: [openid, profile, email, offline_access, groups]
+  # Cognitoは groups scope ではなく cognito:groups claim を返す。またデフォルトでIDトークンに含まれるスコープなので cognito:groups scope の定義も不要。
+  # Cognitoはrefresh_token をデフォルトで返すので offline_access scope は不要
+  scopes: [openid, profile, email]
+  # scopes: [openid, profile, email, offline_access, groups]
   # allowed_email_domains: [example.com]   # uncomment and restrict for production
 
 session:
