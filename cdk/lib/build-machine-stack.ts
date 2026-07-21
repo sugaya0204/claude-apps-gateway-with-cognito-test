@@ -3,6 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import * as customResources from 'aws-cdk-lib/custom-resources';
 import { Construct } from 'constructs';
@@ -86,6 +87,43 @@ export class BuildMachineStack extends cdk.Stack {
     gatewaySource.grantRead(buildRole);
     adminConsoleSource.grantRead(buildRole);
 
+    // The SSM build command's output is large enough (docker push progress,
+    // dnf/apt logs, etc.) to hit GetCommandInvocation's 24,000-character
+    // capture limit, silently truncating whatever failure reason follows.
+    // Streaming the full, untruncated output to a dedicated log group (via
+    // CloudWatchOutputConfig on the SendCommand call below) means the real
+    // error is always recoverable here, regardless of that limit. It's the
+    // build instance's own SSM agent that writes these logs, so the write
+    // permission belongs on buildRole, not the Lambda's role.
+    // RETAIN (not DESTROY, unlike the rest of this stack): a CREATE_FAILED
+    // custom resource triggers an automatic rollback that deletes every
+    // resource this attempt created, including a DESTROY-policy log group --
+    // which would erase the one place the real failure reason survives
+    // before anyone gets a chance to read it. Retaining just this log group
+    // leaves it orphaned (outside the stack) after a failed attempt; it's a
+    // debugging artifact, not infrastructure, so that's an acceptable
+    // cleanup cost -- and its own ONE_WEEK retention still ages it out.
+    const buildCommandLogGroup = new logs.LogGroup(this, 'BuildCommandLogGroup', {
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    buildCommandLogGroup.grantWrite(buildRole);
+    // grantWrite only covers CreateLogStream/PutLogEvents. The SSM agent
+    // also needs Describe permissions to locate the log group/stream before
+    // it can write to them -- without these, CloudWatchOutputConfig fails
+    // silently (the shell command still runs, it just never reaches
+    // CloudWatch), which is exactly what was observed: an empty log group
+    // after a failed build. DescribeLogGroups has no resource-level
+    // restriction, so it must be "*"; DescribeLogStreams can stay scoped.
+    buildRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['logs:DescribeLogGroups'],
+      resources: ['*'],
+    }));
+    buildRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['logs:DescribeLogStreams'],
+      resources: [buildCommandLogGroup.logGroupArn],
+    }));
+
     const buildSecurityGroup = new ec2.SecurityGroup(this, 'BuildMachineSecurityGroup', {
       vpc: props.vpc,
       description: 'SG for the temporary build machine: no inbound rules at all, SSM-only access',
@@ -152,12 +190,21 @@ export class BuildMachineStack extends cdk.Stack {
           throw new Error('Instance never registered with SSM in time');
         }
 
-        async function runCommand(instanceId, commands, timeoutSeconds = 780) {
+        async function runCommand(instanceId, commands, logGroupName, timeoutSeconds = 780) {
           const send = await ssm.send(new SendCommandCommand({
             InstanceIds: [instanceId],
             DocumentName: 'AWS-RunShellScript',
             Parameters: { commands },
             TimeoutSeconds: timeoutSeconds,
+            // GetCommandInvocation below truncates StandardOutputContent /
+            // StandardErrorContent at 24,000 characters, which docker push's
+            // progress output blows past easily. The full, untruncated output
+            // still lands here regardless, so the real failure reason is
+            // always recoverable even when the polled content below is not.
+            CloudWatchOutputConfig: {
+              CloudWatchLogGroupName: logGroupName,
+              CloudWatchOutputEnabled: true,
+            },
           }));
           const commandId = send.Command.CommandId;
 
@@ -174,16 +221,15 @@ export class BuildMachineStack extends cdk.Stack {
               return invocation.StandardOutputContent || '';
             }
             if (['Failed', 'Cancelled', 'TimedOut'].includes(invocation.Status)) {
-              // CloudFormation Custom Resource responses have a hard size
-              // limit (well under a typical docker-build log), so the raw
-              // SSM output can't be thrown verbatim here -- doing so
-              // previously surfaced as an opaque "Response object is too
-              // long" error that hid the actual failure entirely. Truncate
-              // to the last part of the output, which is where the actual
-              // failing command's error normally appears.
-              const raw = invocation.StandardErrorContent || invocation.StandardOutputContent || '';
-              const truncated = raw.length > 1000 ? '...(truncated)...\\n' + raw.slice(-1000) : raw;
-              throw new Error(\`Command failed (\${invocation.Status}): \${truncated}\`);
+              // Keep only the tail: the failure detail is what's near the end,
+              // and the full response back to CloudFormation must stay well
+              // under its own size limit or the whole custom resource call
+              // fails with "Response object is too long" -- masking this
+              // error rather than reporting it. See CloudWatch log group
+              // \${logGroupName} (command ID \${commandId}) for the complete,
+              // untruncated output.
+              const detail = (invocation.StandardErrorContent || invocation.StandardOutputContent || '').slice(-1500);
+              throw new Error(\`Command failed (\${invocation.Status}), command ID \${commandId}, see CloudWatch log group \${logGroupName} for full output: \${detail}\`);
             }
           }
           throw new Error('Command timed out waiting for completion');
@@ -199,6 +245,7 @@ export class BuildMachineStack extends cdk.Stack {
             gatewaySourceBucket, gatewaySourceKey,
             adminConsoleSourceBucket, adminConsoleSourceKey,
             gatewayRepoUri, adminConsoleRepoUri,
+            buildLogGroupName,
           } = event.ResourceProperties;
 
           await waitForSsm(instanceId);
@@ -233,7 +280,7 @@ export class BuildMachineStack extends cdk.Stack {
             \`sudo docker push \${gatewayTag}\`,
             \`sudo docker build -t \${consoleTag} /home/ec2-user/build/admin-console\`,
             \`sudo docker push \${consoleTag}\`,
-          ]);
+          ], buildLogGroupName);
 
           return {
             PhysicalResourceId: \`image-builder-\${instanceId}\`,
@@ -263,6 +310,7 @@ export class BuildMachineStack extends cdk.Stack {
         adminConsoleSourceKey: adminConsoleSource.s3ObjectKey,
         gatewayRepoUri: gatewayRepo.repositoryUri,
         adminConsoleRepoUri: adminConsoleRepo.repositoryUri,
+        buildLogGroupName: buildCommandLogGroup.logGroupName,
       },
     });
     builder.node.addDependency(buildInstance);
@@ -281,5 +329,9 @@ export class BuildMachineStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'GatewayImageUri', { value: this.gatewayImageUri });
     new cdk.CfnOutput(this, 'AdminConsoleImageUri', { value: this.adminConsoleImageUri });
+    new cdk.CfnOutput(this, 'BuildCommandLogGroupName', {
+      value: buildCommandLogGroup.logGroupName,
+      description: 'Full, untruncated output of the build/push SSM command -- check here if the ImageBuilder custom resource fails',
+    });
   }
 }
