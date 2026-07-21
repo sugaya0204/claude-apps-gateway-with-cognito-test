@@ -76,7 +76,15 @@ export class GatewayStack extends cdk.Stack {
       sid: 'BedrockInvokeClaudeModels',
       actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
       resources: [
-        `arn:${cdk.Aws.PARTITION}:bedrock:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:inference-profile/us.anthropic.*`,
+        // Cross-region inference profiles are scoped to the source region
+        // they're invoked from -- an ap-northeast-1 deployment needs the
+        // jp./global. prefixes, not us. (confirmed against this account's
+        // actual `bedrock list-inference-profiles --region ap-northeast-1`
+        // output; an earlier draft copied the us. prefix from a US-region
+        // example and it produced Bedrock's "provided model identifier is
+        // invalid" error for every request).
+        `arn:${cdk.Aws.PARTITION}:bedrock:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:inference-profile/jp.anthropic.*`,
+        `arn:${cdk.Aws.PARTITION}:bedrock:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:inference-profile/global.anthropic.*`,
         `arn:${cdk.Aws.PARTITION}:bedrock:*::foundation-model/anthropic.*`,
       ],
     }));
